@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>IMU Viewer</title>
+  <style>
+    body { font-family: system-ui, Arial; margin: 16px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 12px; margin: 10px 0; }
+    .big { font-size: 20px; font-weight: 700; }
+    .row { display: grid; grid-template-columns: 80px 1fr; gap: 8px; align-items: center; }
+    button { padding: 10px 12px; border-radius: 10px; border: 1px solid #ddd; background: #f7f7f7; }
+    canvas { width: 100%; height: 140px; border: 1px solid #eee; border-radius: 10px; }
+    .muted { color: #666; font-size: 13px; }
+    .warn { color: #b45309; }
+  </style>
+</head>
+<body>
+  <h2>Android IMU (Accelerometer) Viewer</h2>
+
+  <div class="card">
+    <button id="btnStart">Start sensors</button>
+    <div id="status" class="muted" style="margin-top:10px;">Status: not started</div>
+    <div class="muted warn" style="margin-top:6px;">
+      Tip: On some phones you must tap “Start sensors” and allow motion permissions.
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="big">Acceleration (m/s²)</div>
+    <div class="row"><div>X</div><div id="ax">—</div></div>
+    <div class="row"><div>Y</div><div id="ay">—</div></div>
+    <div class="row"><div>Z</div><div id="az">—</div></div>
+    <div class="row"><div>Magnitude</div><div id="amag">—</div></div>
+  </div>
+
+  <div class="card">
+    <div class="big">Acceleration incl. gravity (m/s²)</div>
+    <div class="row"><div>X</div><div id="agx">—</div></div>
+    <div class="row"><div>Y</div><div id="agy">—</div></div>
+    <div class="row"><div>Z</div><div id="agz">—</div></div>
+  </div>
+
+  <div class="card">
+    <div class="big">Simple live plot (magnitude)</div>
+    <canvas id="plot" width="900" height="260"></canvas>
+    <div class="muted" id="rate">Rate: — Hz</div>
+  </div>
+
+<script>
+  const el = (id) => document.getElementById(id);
+  const statusEl = el("status");
+
+  const axEl = el("ax"), ayEl = el("ay"), azEl = el("az"), amagEl = el("amag");
+  const agxEl = el("agx"), agyEl = el("agy"), agzEl = el("agz");
+  const rateEl = el("rate");
+
+  const canvas = el("plot");
+  const ctx = canvas.getContext("2d");
+
+  let started = false;
+  let lastT = null;
+  let hzEMA = 0;
+
+  // ring buffer for plotting
+  const N = 300;
+  const magBuf = new Array(N).fill(0);
+  let idx = 0;
+
+  function fmt(v) {
+    if (v === null || v === undefined || Number.isNaN(v)) return "—";
+    return v.toFixed(3);
+  }
+
+  function drawPlot() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    // axes
+    ctx.globalAlpha = 1;
+    ctx.beginPath();
+    ctx.moveTo(40, 10);
+    ctx.lineTo(40, canvas.height - 20);
+    ctx.lineTo(canvas.width - 10, canvas.height - 20);
+    ctx.strokeStyle = "#bbb";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // scale
+    // Typical magnitude around 9.8 when including gravity; but we plot "acceleration" magnitude which is often small.
+    // auto-scale using recent values
+    let maxV = 0.1;
+    for (let i = 0; i < N; i++) maxV = Math.max(maxV, Math.abs(magBuf[i]));
+    maxV = Math.max(maxV, 0.5);
+
+    const left = 40, top = 10, bottom = canvas.height - 20, right = canvas.width - 10;
+    const w = right - left, h = bottom - top;
+
+    // plot line
+    ctx.beginPath();
+    for (let i = 0; i < N; i++) {
+      const j = (idx + i) % N; // oldest -> newest
+      const x = left + (i / (N - 1)) * w;
+      const y = bottom - ((magBuf[j] / maxV) * (h * 0.9)); // scale
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = "#111";
+    ctx.lineWidth = 2;
+    ctx.stroke();
+
+    // label
+    ctx.fillStyle = "#666";
+    ctx.font = "16px system-ui";
+    ctx.fillText(`±${maxV.toFixed(2)} m/s²`, left + 6, top + 18);
+  }
+
+  function onMotion(e) {
+    // acceleration (without gravity) might be null on some devices
+    const a = e.acceleration || {};
+    const ag = e.accelerationIncludingGravity || {};
+
+    const ax = a.x, ay = a.y, az = a.z;
+    axEl.textContent = fmt(ax);
+    ayEl.textContent = fmt(ay);
+    azEl.textContent = fmt(az);
+
+    const amag = (ax != null && ay != null && az != null)
+      ? Math.sqrt(ax*ax + ay*ay + az*az)
+      : null;
+    amagEl.textContent = fmt(amag);
+
+    agxEl.textContent = fmt(ag.x);
+    agyEl.textContent = fmt(ag.y);
+    agzEl.textContent = fmt(ag.z);
+
+    // update rate estimate
+    const t = e.timeStamp; // ms
+    if (lastT != null) {
+      const dt = Math.max(1, t - lastT) / 1000.0;
+      const hz = 1.0 / dt;
+      hzEMA = hzEMA ? (0.9 * hzEMA + 0.1 * hz) : hz;
+      rateEl.textContent = `Rate: ${hzEMA.toFixed(1)} Hz`;
+    }
+    lastT = t;
+
+    // plot buffer (use amag if available, else use incl gravity magnitude-9.8-ish is messy, but ok)
+    const val = (amag != null) ? amag : 0;
+    magBuf[idx] = val;
+    idx = (idx + 1) % N;
+    drawPlot();
+  }
+
+  async function startSensors() {
+    if (started) return;
+
+    if (!("DeviceMotionEvent" in window)) {
+      statusEl.textContent = "Status: DeviceMotion not supported in this browser.";
+      return;
+    }
+
+    // iOS requires explicit permission; Android usually doesn't, but safe to check.
+    if (typeof DeviceMotionEvent.requestPermission === "function") {
+      try {
+        const res = await DeviceMotionEvent.requestPermission();
+        if (res !== "granted") {
+          statusEl.textContent = "Status: motion permission not granted.";
+          return;
+        }
+      } catch (err) {
+        statusEl.textContent = "Status: permission request failed: " + err;
+        return;
+      }
+    }
+
+    window.addEventListener("devicemotion", onMotion, { passive: true });
+    started = true;
+    statusEl.textContent = "Status: running (move the phone)";
+  }
+
+  el("btnStart").addEventListener("click", startSensors);
+</script>
+</body>
+</html>

@@ -1,0 +1,207 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>IMU Debug Viewer</title>
+  <style>
+    body{font-family:system-ui,Arial;margin:16px}
+    .card{border:1px solid #ddd;border-radius:12px;padding:12px;margin:10px 0}
+    button{padding:10px 12px;border-radius:10px;border:1px solid #ddd;background:#f7f7f7}
+    pre{white-space:pre-wrap;word-break:break-word}
+    .ok{color:#166534} .bad{color:#b91c1c} .muted{color:#555}
+  </style>
+</head>
+<body>
+<h2>IMU Debug Viewer (Android)</h2>
+
+<div class="card">
+  <button id="startBtn">Start</button>
+  <div id="secure" class="muted"></div>
+  <div id="status" class="muted" style="margin-top:8px">Status: idle</div>
+</div>
+
+<div class="card">
+  <b>Data</b>
+  <pre id="out">—</pre>
+</div>
+
+<div class="card">
+  <b>Debug</b>
+  <pre id="dbg">—</pre>
+</div>
+
+<script>
+const out = document.getElementById("out");
+const dbg = document.getElementById("dbg");
+const statusEl = document.getElementById("status");
+const secureEl = document.getElementById("secure");
+
+function logDbg(msg){
+  dbg.textContent = (dbg.textContent === "—" ? "" : dbg.textContent + "\n") + msg;
+}
+function setStatus(msg, good=false){
+  statusEl.textContent = "Status: " + msg;
+  statusEl.className = good ? "ok" : "muted";
+}
+function fmt(n){ return (n === null || n === undefined || Number.isNaN(n)) ? "—" : n.toFixed(4); }
+
+secureEl.innerHTML =
+  `Secure context: <b class="${window.isSecureContext ? "ok":"bad"}">${window.isSecureContext}</b> (HTTPS required on many phones)`;
+
+let using = null;
+let accel = null;
+let lin = null;
+let gyro = null;
+let motionHandler = null;
+
+function stopAll(){
+  if (accel) try{ accel.stop(); }catch(e){}
+  if (lin)   try{ lin.stop(); }catch(e){}
+  if (gyro)  try{ gyro.stop(); }catch(e){}
+  accel = lin = gyro = null;
+
+  if (motionHandler){
+    window.removeEventListener("devicemotion", motionHandler);
+    motionHandler = null;
+  }
+  using = null;
+}
+
+async function tryGenericSensors(){
+  // Needs secure context in many cases
+  if (!("Accelerometer" in window) && !("LinearAccelerationSensor" in window) && !("Gyroscope" in window)){
+    logDbg("Generic Sensor API: not available in this browser.");
+    return false;
+  }
+
+  // Permissions API is inconsistent, but we try it.
+  async function tryPerm(name){
+    if (!("permissions" in navigator) || !navigator.permissions.query) return "unknown";
+    try{
+      const res = await navigator.permissions.query({ name });
+      return res.state; // 'granted'|'denied'|'prompt'
+    }catch(e){
+      return "unknown";
+    }
+  }
+
+  const accPerm = await tryPerm("accelerometer");
+  const gyrPerm = await tryPerm("gyroscope");
+  logDbg(`Permissions: accelerometer=${accPerm}, gyroscope=${gyrPerm}`);
+
+  // Start sensors (some browsers throw if not allowed)
+  const started = [];
+
+  if ("LinearAccelerationSensor" in window){
+    try{
+      lin = new LinearAccelerationSensor({ frequency: 60 });
+      lin.addEventListener("reading", () => {
+        using = "GenericSensor: LinearAccelerationSensor";
+        out.textContent =
+          `${using}\n` +
+          `x: ${fmt(lin.x)}\n` +
+          `y: ${fmt(lin.y)}\n` +
+          `z: ${fmt(lin.z)}\n`;
+      });
+      lin.addEventListener("error", (e) => logDbg("LinearAcceleration error: " + (e.error?.name || e.message || e)));
+      lin.start();
+      started.push("LinearAccelerationSensor");
+    }catch(e){ logDbg("LinearAccelerationSensor start failed: " + e); }
+  }
+
+  if ("Accelerometer" in window){
+    try{
+      accel = new Accelerometer({ frequency: 60 });
+      accel.addEventListener("reading", () => {
+        // If linear acc is running, keep that as primary.
+        if (!using) using = "GenericSensor: Accelerometer";
+        if (using === "GenericSensor: Accelerometer"){
+          out.textContent =
+            `${using}\n` +
+            `x: ${fmt(accel.x)}\n` +
+            `y: ${fmt(accel.y)}\n` +
+            `z: ${fmt(accel.z)}\n`;
+        }
+      });
+      accel.addEventListener("error", (e) => logDbg("Accelerometer error: " + (e.error?.name || e.message || e)));
+      accel.start();
+      started.push("Accelerometer");
+    }catch(e){ logDbg("Accelerometer start failed: " + e); }
+  }
+
+  if ("Gyroscope" in window){
+    try{
+      gyro = new Gyroscope({ frequency: 60 });
+      gyro.addEventListener("reading", () => {
+        logDbg(`Gyro reading: x=${fmt(gyro.x)} y=${fmt(gyro.y)} z=${fmt(gyro.z)}`);
+      });
+      gyro.addEventListener("error", (e) => logDbg("Gyroscope error: " + (e.error?.name || e.message || e)));
+      gyro.start();
+      started.push("Gyroscope");
+    }catch(e){ logDbg("Gyroscope start failed: " + e); }
+  }
+
+  if (started.length){
+    setStatus("running (" + started.join(", ") + ")", true);
+    return true;
+  }
+  logDbg("Generic Sensor API: present but nothing started (likely permission / HTTPS issue).");
+  return false;
+}
+
+async function tryDeviceMotion(){
+  if (!("DeviceMotionEvent" in window)){
+    logDbg("DeviceMotionEvent: not available.");
+    return false;
+  }
+
+  // iOS needs requestPermission; Android usually doesn't, but harmless to check.
+  if (typeof DeviceMotionEvent.requestPermission === "function"){
+    try{
+      const res = await DeviceMotionEvent.requestPermission();
+      logDbg("DeviceMotion permission result: " + res);
+      if (res !== "granted") return false;
+    }catch(e){
+      logDbg("DeviceMotion requestPermission failed: " + e);
+      return false;
+    }
+  } else {
+    logDbg("DeviceMotionEvent.requestPermission: not required/available (common on Android).");
+  }
+
+  motionHandler = (e) => {
+    using = "DeviceMotionEvent";
+    const a = e.acceleration || {};
+    const ag = e.accelerationIncludingGravity || {};
+    out.textContent =
+      `${using}\n` +
+      `accel (no grav): x=${fmt(a.x)} y=${fmt(a.y)} z=${fmt(a.z)}\n` +
+      `incl grav:       x=${fmt(ag.x)} y=${fmt(ag.y)} z=${fmt(ag.z)}\n`;
+  };
+
+  window.addEventListener("devicemotion", motionHandler, { passive: true });
+  setStatus("running (DeviceMotionEvent)", true);
+  return true;
+}
+
+document.getElementById("startBtn").addEventListener("click", async () => {
+  stopAll();
+  dbg.textContent = "—";
+  out.textContent = "—";
+  setStatus("starting...");
+
+  // Try Generic Sensor API first (often better on Android)
+  const ok1 = await tryGenericSensors();
+  if (ok1) return;
+
+  // Fallback to DeviceMotion
+  const ok2 = await tryDeviceMotion();
+  if (ok2) return;
+
+  setStatus("no sensor data (see Debug)", false);
+  logDbg("Nothing worked. Most common fix: host on HTTPS + enable Motion sensors in Android settings.");
+});
+</script>
+</body>
+</html>
